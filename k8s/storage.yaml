@@ -1,0 +1,31 @@
+# persistent volume - basically a folder on the host machine
+# this is where we'll store the trained model so both training and inference can access it
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 10Gi  # 10 gigs should be plenty for our model
+  accessModes:
+    - ReadWriteOnce  # only one pod can write at a time
+  hostPath:
+    path: "/tmp/kube-ai-models"  # folder on the host machine
+---
+# persistent volume claim - this is what pods actually use
+# it's like asking kubernetes "hey, give me some storage"
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+

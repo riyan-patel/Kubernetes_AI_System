@@ -1,0 +1,44 @@
+# kubernetes job that runs our training script
+# this will train the model and save it to shared storage
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ai-model-training
+  labels:
+    app: ai-training
+    component: training
+spec:
+  template:
+    metadata:
+      labels:
+        app: ai-training
+        component: training
+    spec:
+      restartPolicy: Never  # don't restart if it fails
+      containers:
+      - name: training
+        image: ai-training:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            memory: "2Gi"    # need some memory for pytorch
+            cpu: "1000m"     # 1 cpu core
+          limits:
+            memory: "4Gi"    # max 4 gigs
+            cpu: "2000m"     # max 2 cpu cores
+        env:
+        - name: BATCH_SIZE
+          value: "32"        # how many images per batch
+        - name: EPOCHS
+          value: "10"        # how many times to go through the data
+        - name: LEARNING_RATE
+          value: "0.001"     # how fast the model learns
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models  # where to save the trained model
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc  # use our shared storage
+  backoffLimit: 3  # try up to 3 times if it fails
+
