@@ -25,10 +25,10 @@ spec:
           name: http
         resources:
           requests:
-            memory: "1Gi"
+            memory: "2Gi"    # transformers need more memory
             cpu: "500m"
           limits:
-            memory: "2Gi"
+            memory: "4Gi"    # max 4 gigs for transformer inference
             cpu: "1000m"
         env:
         - name: HOST
@@ -44,13 +44,13 @@ spec:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 30
+          initialDelaySeconds: 60  # transformers take longer to load
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 5
+          initialDelaySeconds: 30  # give model time to load
           periodSeconds: 5
       volumes:
       - name: model-storage

@@ -1,224 +1,255 @@
 #!/usr/bin/env python3
 """
-just a simple script to train a cnn on cifar-10 images
-nothing fancy, just basic image classification
+Train Flan-T5 model on MultiNLI dataset for natural language inference
+Fine-tunes pre-trained Flan-T5 for entailment/contradiction/neutral classification
 """
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-import numpy as np
-import matplotlib.pyplot as plt
+from transformers import (
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForSeq2Seq
+)
+from datasets import load_dataset
+from torch.utils.data import Dataset
 import os
 import json
 from datetime import datetime
 import logging
+from typing import Dict, List
 
-# setup logging so we can see what's happening
+# setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SimpleCNN(nn.Module):
-    """basic cnn for classifying images"""
+# MultiNLI label mapping
+LABEL_MAP = {
+    "entailment": 0,
+    "neutral": 1,
+    "contradiction": 2
+}
+
+REVERSE_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
+
+class MultiNLIDataset(Dataset):
+    """Dataset wrapper for MultiNLI"""
     
-    def __init__(self, num_classes=10):
-        super(SimpleCNN, self).__init__()
-        # first conv layer - takes rgb images and outputs 32 feature maps
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        # second conv layer - more feature maps
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        # pooling to reduce size
-        self.pool = nn.MaxPool2d(2, 2)
-        # fully connected layers
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = nn.Linear(128, num_classes)
-        # dropout to prevent overfitting
-        self.dropout = nn.Dropout(0.5)
+    def __init__(self, dataset, tokenizer, max_length=512):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
         
-    def forward(self, x):
-        # pass through conv layers with relu and pooling
-        x = self.pool(torch.relu(self.conv1(x)))
-        x = self.pool(torch.relu(self.conv2(x)))
-        # flatten for fully connected layers
-        x = x.view(-1, 64 * 8 * 8)
-        x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        # final classification layer
-        x = self.fc2(x)
-        return x
+        # Create input text: "premise: {premise} hypothesis: {hypothesis}"
+        input_text = f"premise: {item['premise']} hypothesis: {item['hypothesis']}"
+        
+        # Get label - handle both string and integer labels
+        label = item['label']
+        if isinstance(label, int):
+            # Convert integer label to text
+            label_text = REVERSE_LABEL_MAP.get(label, "neutral")
+        elif isinstance(label, str):
+            # Already a string, use it directly
+            label_text = label
+        else:
+            # Fallback
+            label_text = "neutral"
+        
+        # Tokenize input (no padding - data collator will handle it)
+        inputs = self.tokenizer(
+            input_text,
+            max_length=self.max_length,
+            padding=False,
+            truncation=True,
+            return_tensors=None  # Return as list, not tensor
+        )
+        
+        # Tokenize label text for text-to-text generation (no padding)
+        labels = self.tokenizer(
+            label_text,
+            max_length=10,
+            padding=False,
+            truncation=True,
+            return_tensors=None  # Return as list, not tensor
+        )
+        
+        # Get label ID for evaluation
+        if isinstance(label, int):
+            label_id = label
+        else:
+            label_id = LABEL_MAP.get(label, -1)
+        
+        return {
+            'input_ids': inputs['input_ids'],
+            'attention_mask': inputs['attention_mask'],
+            'labels': labels['input_ids'],
+            'label_id': label_id
+        }
 
-def get_data_loaders(batch_size=32):
-    """grab the cifar-10 dataset and set it up for training"""
+def get_data_loaders(tokenizer, batch_size=8, max_length=512):
+    """Load MultiNLI dataset and create data loaders"""
     
-    # data augmentation for training - makes the model more robust
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    logger.info("Loading MultiNLI dataset from Hugging Face...")
     
-    # simpler transform for testing - no augmentation
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    # Load MultiNLI dataset (automatically downloads if not cached)
+    dataset = load_dataset("multi_nli")
     
-    # download cifar-10 if we don't have it
-    train_dataset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=transform_train
-    )
+    # Use matched validation set
+    train_dataset = MultiNLIDataset(dataset['train'], tokenizer, max_length)
+    val_dataset = MultiNLIDataset(dataset['validation_matched'], tokenizer, max_length)
     
-    test_dataset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_test
-    )
+    logger.info(f"Train samples: {len(train_dataset)}")
+    logger.info(f"Validation samples: {len(val_dataset)}")
     
-    # create data loaders for batching
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    
-    return train_loader, test_loader
+    return train_dataset, val_dataset
 
-def train_model(model, train_loader, test_loader, epochs=10, learning_rate=0.001):
-    """actually train the model - this is where the magic happens"""
+def compute_metrics(eval_pred):
+    """Compute accuracy for evaluation"""
+    predictions, labels = eval_pred
     
-    # use gpu if available, otherwise cpu
+    # For text-to-text, we need to decode predictions
+    # For simplicity, we'll use the label_id for accuracy
+    # In practice, you'd decode the text predictions
+    return {"accuracy": 0.0}  # Placeholder - would need proper decoding
+
+def train_model(model, tokenizer, train_dataset, val_dataset, epochs=3, learning_rate=5e-5, batch_size=8):
+    """Train the Flan-T5 model"""
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    model = model.to(device)
-    # cross entropy loss is good for classification
-    criterion = nn.CrossEntropyLoss()
-    # adam optimizer usually works well
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Get gradient accumulation steps from environment or use default
+    gradient_accumulation_steps = int(os.getenv('GRADIENT_ACCUMULATION_STEPS', 4))
     
-    # keep track of how we're doing
-    train_losses = []
-    train_accuracies = []
-    test_accuracies = []
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir='/app/models/checkpoints',
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=max(1, batch_size // 2),  # Smaller eval batch
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        weight_decay=0.01,
+        logging_dir='/app/models/logs',
+        logging_steps=100,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        save_total_limit=2,
+        fp16=torch.cuda.is_available(),  # Use mixed precision if GPU available
+        dataloader_pin_memory=False,  # Disable pin_memory to save RAM
+    )
     
-    for epoch in range(epochs):
-        # training mode
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            
-            # standard training loop
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            
-            # track progress
-            running_loss += loss.item()
-            _, predicted = output.max(1)
-            total += target.size(0)
-            correct += predicted.eq(target).sum().item()
-            
-            # print progress every 100 batches
-            if batch_idx % 100 == 0:
-                logger.info(f'Epoch {epoch+1}/{epochs}, Batch {batch_idx}, Loss: {loss.item():.4f}')
-        
-        # calculate how well we did this epoch
-        train_acc = 100. * correct / total
-        avg_loss = running_loss / len(train_loader)
-        
-        train_losses.append(avg_loss)
-        train_accuracies.append(train_acc)
-        
-        # test the model
-        model.eval()
-        test_correct = 0
-        test_total = 0
-        
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                _, predicted = output.max(1)
-                test_total += target.size(0)
-                test_correct += predicted.eq(target).sum().item()
-        
-        test_acc = 100. * test_correct / test_total
-        test_accuracies.append(test_acc)
-        
-        logger.info(f'Epoch {epoch+1}/{epochs} - Train Loss: {avg_loss:.4f}, Train Acc: {train_acc:.2f}%, Test Acc: {test_acc:.2f}%')
+    # Data collator for seq2seq (text-to-text) tasks
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True
+    )
     
-    return train_losses, train_accuracies, test_accuracies
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+    )
+    
+    logger.info("Starting training...")
+    trainer.train()
+    
+    logger.info("Training completed!")
+    
+    # Evaluate
+    logger.info("Evaluating on validation set...")
+    eval_results = trainer.evaluate()
+    logger.info(f"Validation results: {eval_results}")
+    
+    return trainer, eval_results
 
-def save_model_and_metrics(model, train_losses, train_accuracies, test_accuracies):
-    """save the trained model and some stats about how it did"""
+def save_model_and_metrics(model, tokenizer, eval_results, output_dir='/app/models'):
+    """Save the trained model and metrics"""
     
-    # make sure the models folder exists
-    os.makedirs('/app/models', exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
-    # save the model weights
-    model_path = '/app/models/trained_model.pth'
-    torch.save(model.state_dict(), model_path)
-    logger.info(f"Model saved to {model_path}")
+    # Save model and tokenizer
+    model_save_path = os.path.join(output_dir, 'flan_t5_multinli')
+    model.save_pretrained(model_save_path)
+    tokenizer.save_pretrained(model_save_path)
+    logger.info(f"Model saved to {model_save_path}")
     
-    # save some useful info about training
+    # Save metrics
     metrics = {
-        'train_losses': train_losses,
-        'train_accuracies': train_accuracies,
-        'test_accuracies': test_accuracies,
-        'final_test_accuracy': test_accuracies[-1],
-        'training_completed_at': datetime.now().isoformat()
+        'eval_loss': eval_results.get('eval_loss', 0),
+        'eval_runtime': eval_results.get('eval_runtime', 0),
+        'eval_samples_per_second': eval_results.get('eval_samples_per_second', 0),
+        'training_completed_at': datetime.now().isoformat(),
+        'model_type': 'flan-t5',
+        'dataset': 'multi_nli',
+        'task': 'natural_language_inference'
     }
     
-    metrics_path = '/app/models/training_metrics.json'
+    metrics_path = os.path.join(output_dir, 'training_metrics.json')
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     logger.info(f"Training metrics saved to {metrics_path}")
     
-    return model_path, metrics_path
+    return model_save_path, metrics_path
 
 def main():
-    """main function - runs everything"""
+    """Main training function"""
     
-    logger.info("Starting AI model training...")
+    logger.info("Starting Flan-T5 MultiNLI training...")
     
-    # get config from environment variables or use defaults
-    BATCH_SIZE = int(os.getenv('BATCH_SIZE', 32))
-    EPOCHS = int(os.getenv('EPOCHS', 10))
-    LEARNING_RATE = float(os.getenv('LEARNING_RATE', 0.001))
+    # Get config from environment variables or use defaults
+    BATCH_SIZE = int(os.getenv('BATCH_SIZE', 8))  # Smaller batch for transformers
+    EPOCHS = int(os.getenv('EPOCHS', 3))  # Fewer epochs for fine-tuning
+    LEARNING_RATE = float(os.getenv('LEARNING_RATE', 5e-5))
+    MODEL_NAME = os.getenv('MODEL_NAME', 'google/flan-t5-base')
+    MAX_LENGTH = int(os.getenv('MAX_LENGTH', 512))
     
-    logger.info(f"Training configuration: Batch Size={BATCH_SIZE}, Epochs={EPOCHS}, LR={LEARNING_RATE}")
+    logger.info(f"Training configuration:")
+    logger.info(f"  Model: {MODEL_NAME}")
+    logger.info(f"  Batch Size: {BATCH_SIZE}")
+    logger.info(f"  Epochs: {EPOCHS}")
+    logger.info(f"  Learning Rate: {LEARNING_RATE}")
+    logger.info(f"  Max Length: {MAX_LENGTH}")
     
-    # load the data
-    logger.info("Loading CIFAR-10 dataset...")
-    train_loader, test_loader = get_data_loaders(BATCH_SIZE)
+    # Load tokenizer and model
+    logger.info(f"Loading {MODEL_NAME}...")
+    tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
+    model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
     
-    # create our model
-    logger.info("Creating model...")
-    model = SimpleCNN(num_classes=10)
-    
-    # print some info about the model
+    # Print model info
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model created with {total_params:,} parameters")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model loaded: {total_params:,} total parameters, {trainable_params:,} trainable")
     
-    # train it!
-    logger.info("Starting training...")
-    train_losses, train_accuracies, test_accuracies = train_model(
-        model, train_loader, test_loader, EPOCHS, LEARNING_RATE
+    # Load data
+    logger.info("Loading MultiNLI dataset...")
+    train_dataset, val_dataset = get_data_loaders(tokenizer, BATCH_SIZE, MAX_LENGTH)
+    
+    # Train
+    trainer, eval_results = train_model(
+        model, tokenizer, train_dataset, val_dataset, 
+        EPOCHS, LEARNING_RATE, BATCH_SIZE
     )
     
-    # save everything
-    model_path, metrics_path = save_model_and_metrics(model, train_losses, train_accuracies, test_accuracies)
+    # Save
+    model_path, metrics_path = save_model_and_metrics(model, tokenizer, eval_results)
     
-    logger.info(f"Training completed successfully!")
-    logger.info(f"Final test accuracy: {test_accuracies[-1]:.2f}%")
+    logger.info("Training completed successfully!")
     logger.info(f"Model saved to: {model_path}")
     logger.info(f"Metrics saved to: {metrics_path}")
 
 if __name__ == "__main__":
     main()
-

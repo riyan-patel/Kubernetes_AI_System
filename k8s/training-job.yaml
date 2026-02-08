@@ -17,22 +17,28 @@ spec:
       restartPolicy: Never  # don't restart if it fails
       containers:
       - name: training
-        image: ai-training:latest
+        image: ai-training:v2
         imagePullPolicy: IfNotPresent
         resources:
           requests:
-            memory: "2Gi"    # need some memory for pytorch
+            memory: "2Gi"    # reduced for minikube compatibility
             cpu: "1000m"     # 1 cpu core
           limits:
-            memory: "4Gi"    # max 4 gigs
+            memory: "4Gi"    # max 4 gigs for transformer training
             cpu: "2000m"     # max 2 cpu cores
         env:
         - name: BATCH_SIZE
-          value: "32"        # how many images per batch
+          value: "4"         # can use larger batch with smaller model
+        - name: GRADIENT_ACCUMULATION_STEPS
+          value: "2"         # accumulate gradients to simulate batch size of 8
         - name: EPOCHS
-          value: "10"        # how many times to go through the data
+          value: "3"          # fewer epochs for fine-tuning
         - name: LEARNING_RATE
-          value: "0.001"     # how fast the model learns
+          value: "5e-5"       # learning rate for fine-tuning
+        - name: MODEL_NAME
+          value: "google/flan-t5-small"  # Smaller model to fit in memory
+        - name: MAX_LENGTH
+          value: "256"        # can use longer sequences with smaller model
         volumeMounts:
         - name: model-storage
           mountPath: /app/models  # where to save the trained model
